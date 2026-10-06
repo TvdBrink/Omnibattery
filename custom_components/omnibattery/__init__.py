@@ -1312,6 +1312,10 @@ class ChargeDischargeController:
         self._daily_operation_last_decision_signature = None
         self._daily_operation_last_projection_signature = None
         self._daily_operation_last_projection_monotonic = 0.0
+        self._energy_solar_wh_hours: dict[str, Any] = {}
+        self._energy_solar_periods: tuple[Any, ...] = ()
+        self._energy_solar_wh_fetched_mono: float | None = None
+        self._energy_solar_fetch_task: Any = None
 
         # Apply no-PD direct-tracking overrides last, so they win over the PD params
         # loaded above (and the grid filter tau just set).
@@ -1408,6 +1412,35 @@ class ChargeDischargeController:
     def _schedule_charge_delay_state_save(self) -> None:
         """Persist charge delay latch state (delegates to ChargeDelayManager)."""
         self._charge_delay_mgr.schedule_save()
+
+    async def async_refresh_energy_solar_forecast(self) -> None:
+        """Refresh and cache multi-day solar forecast from Home Assistant's energy platform."""
+        from .solar_forecast import (
+            async_fetch_energy_platform_solar_forecast,
+            solar_forecast_local_timezone,
+            solar_periods_from_wh_hours,
+        )
+
+        data = await async_fetch_energy_platform_solar_forecast(self.hass, self)
+        wh_hours = data.get("wh_hours", {}) if isinstance(data, dict) else {}
+        old_count = len(getattr(self, "_energy_solar_periods", ()))
+        self._energy_solar_wh_hours = dict(wh_hours)
+        self._energy_solar_periods = solar_periods_from_wh_hours(
+            wh_hours,
+            default_timezone=solar_forecast_local_timezone(self.hass, self),
+        )
+        self._energy_solar_wh_fetched_mono = time.monotonic()
+        high_price_mgr = getattr(self, "_high_price_discharge_mgr", None)
+        if high_price_mgr is not None:
+            high_price_mgr._solar_wh_hours = dict(wh_hours)
+            high_price_mgr._solar_wh_fetched_mono = self._energy_solar_wh_fetched_mono
+
+        if len(self._energy_solar_periods) != old_count or bool(self._energy_solar_periods):
+            self._daily_operation_last_projection_signature = None
+            if hasattr(self, "_refresh_daily_operation_timeline"):
+                from homeassistant.util import dt as dt_util
+
+                self._refresh_daily_operation_timeline(dt_util.now())
 
     @staticmethod
     def _daily_operation_float(value: Any, default: float = 0.0) -> float:
@@ -2182,6 +2215,57 @@ class ChargeDischargeController:
             if schedule is not None and mode == "dynamic_pricing"
             else now
         )
+        discharge_allocations: list[Any] = []
+        high_price_mgr = getattr(self, "_high_price_discharge_mgr", None)
+        high_price_plan = (
+            getattr(high_price_mgr, "plan", None)
+            if high_price_mgr is not None
+            else None
+        )
+        if high_price_plan is not None and getattr(high_price_plan, "allocations", None):
+            for alloc in high_price_plan.allocations:
+                start = getattr(alloc, "start", None)
+                end = getattr(alloc, "end", None)
+                if isinstance(start, datetime) and isinstance(end, datetime):
+                    from .pricing.high_price_discharge import TriggerAllocation
+
+                    discharge_allocations.append(
+                        TriggerAllocation(
+                            start=projection_datetime(start),
+                            end=projection_datetime(end),
+                            export_price=getattr(alloc, "export_price", 0.0),
+                            threshold=getattr(alloc, "threshold", 0.0),
+                            energy_kwh=getattr(alloc, "energy_kwh", 0.0),
+                            power_w=getattr(alloc, "power_w", 0.0),
+                            demand_links=getattr(alloc, "demand_links", ()),
+                            surplus_kwh=getattr(alloc, "surplus_kwh", 0.0),
+                            surplus_threshold=getattr(alloc, "surplus_threshold", None),
+                        )
+                    )
+                else:
+                    discharge_allocations.append(alloc)
+
+        curtailment_plan = getattr(self, "_curtailment_plan", None)
+        if curtailment_plan is not None and getattr(curtailment_plan, "selected_discharge_slots", None):
+            for slot in curtailment_plan.selected_discharge_slots:
+                start = getattr(slot, "start", None)
+                end = getattr(slot, "end", None)
+                if isinstance(start, datetime) and isinstance(end, datetime):
+                    from .pricing.curtailment import PreDischargeSlot
+
+                    discharge_allocations.append(
+                        PreDischargeSlot(
+                            start=projection_datetime(start),
+                            end=projection_datetime(end),
+                            price=getattr(slot, "price", 0.0),
+                            planned_energy_kwh=getattr(slot, "planned_energy_kwh", 0.0),
+                            power_w=getattr(slot, "power_w", 0.0),
+                            export_target_w=getattr(slot, "export_target_w", 0.0),
+                        )
+                    )
+                else:
+                    discharge_allocations.append(slot)
+
         return build_daily_operation_projection(
             DailyOperationProjectionRequest(
                 now=now,
@@ -2190,6 +2274,7 @@ class ChargeDischargeController:
                 battery_inputs=tuple(battery_inputs),
                 mode=mode,
                 decision_data=dict(decision_data),
+                discharge_allocations=tuple(discharge_allocations),
                 predictive_charging_enabled=bool(
                     getattr(self, "predictive_charging_enabled", False)
                 ),
@@ -2276,6 +2361,17 @@ class ChargeDischargeController:
                 )
             self._daily_operation_last_runtime_at = current
 
+            if (
+                getattr(self, "_energy_solar_wh_fetched_mono", None) is None
+                or time.monotonic() - self._energy_solar_wh_fetched_mono >= 1800.0
+            ):
+                fetch_task = getattr(self, "_energy_solar_fetch_task", None)
+                if fetch_task is None or fetch_task.done():
+                    if hasattr(self, "hass") and self.hass is not None and hasattr(self.hass, "async_create_task"):
+                        self._energy_solar_fetch_task = self.hass.async_create_task(
+                            self.async_refresh_energy_solar_forecast()
+                        )
+
             schedule = getattr(self, "_dynamic_pricing_schedule", None)
             selected = getattr(schedule, "selected_slots", ()) if schedule is not None else ()
             schedule_signature = tuple(
@@ -2289,9 +2385,48 @@ class ChargeDischargeController:
                 )
                 for slot in selected or ()
             )
+            high_price_mgr = getattr(self, "_high_price_discharge_mgr", None)
+            hp_plan = (
+                getattr(high_price_mgr, "plan", None)
+                if high_price_mgr is not None
+                else None
+            )
+            hp_allocs = (
+                getattr(hp_plan, "allocations", ()) if hp_plan is not None else ()
+            )
+            curt_plan = getattr(self, "_curtailment_plan", None)
+            curt_slots = (
+                getattr(curt_plan, "selected_discharge_slots", ())
+                if curt_plan is not None
+                else ()
+            )
+            discharge_signature = tuple(
+                (
+                    str(getattr(item, "start", "")),
+                    str(getattr(item, "end", "")),
+                    self._daily_operation_float(
+                        getattr(
+                            item,
+                            "energy_kwh",
+                            getattr(item, "planned_energy_kwh", 0.0),
+                        ),
+                        0.0,
+                    ),
+                )
+                for item in tuple(hp_allocs or ()) + tuple(curt_slots or ())
+            )
+            solar_periods = getattr(self, "_energy_solar_periods", ()) or ()
+            solar_periods_sig = (
+                len(solar_periods),
+                self._daily_operation_float(
+                    sum(getattr(p, "energy_kwh", 0.0) for p in solar_periods), 0.0
+                ),
+            )
             projection_signature = (
                 self._daily_operation_mode(),
                 schedule_signature,
+                discharge_signature,
+                solar_periods_sig,
                 bool(getattr(self, "_charge_delay_unlocked", False)),
                 bool(getattr(self, "_delay_setpoint_reached", False)),
                 ChargeDischargeController._daily_operation_weekly_delay_bypass(self),
@@ -11060,6 +11195,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # before Daily Operation consumes them.  The dashboard is strictly a
     # read-only view and must never use a refresh to rebuild control state.
     startup_now = dt_util.now()
+    try:
+        await controller.async_refresh_energy_solar_forecast()
+    except Exception as exc:  # noqa: BLE001
+        _LOGGER.debug("Initial energy solar forecast fetch failed: %s", exc)
+
     if (
         predictive_configured
         and controller.predictive_charging_enabled

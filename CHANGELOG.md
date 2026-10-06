@@ -1,5 +1,12 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- **Daily Operation tomorrow solar forecast from Energy platform**: The 36-hour Daily Operation graph now ingests multi-day solar forecasts directly from Home Assistant's Energy dashboard integrations (Forecast.Solar, Solcast, Open-Meteo), displaying tomorrow morning's solar forecast curve in the extension intervals.
+- **Daily Operation planned discharge in SoC forecast**: Scheduled battery export discharges—including High Price Sale (*Surplus only* and *Surplus + arbitrage*) and smart pre-discharge—are now modeled in the forward SoC projection. The Daily Operation graph reflects the planned battery export, drops the projected SoC accordingly, and flags the corresponding intervals with planned discharge actions.
+
 ## [1.5.0] - 2026-10-04
 
 ### Added

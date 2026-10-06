@@ -21,6 +21,8 @@
  * Design tokens (OKLCH) are embedded so the look matches the handoff exactly;
  * dark/light follows the user's HA theme (hass.themes.darkMode).
  *
+ * Version 1.5.1: Tomorrow solar forecast & planned discharge in Daily Operation graph.
+ *
  * Tabs: Resumen (this overview), Baterías (per-device cards + controls) and
  * Control (system-level entities grouped by feature — each capability's on/off
  * switch plus its CONFIG params: PD tuning, limits, thresholds). The DOM is

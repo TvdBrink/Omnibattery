@@ -1503,9 +1503,12 @@ def _timeline_projection_extension(value: object) -> list[dict[str, object]]:
     numeric_fields = {
         "solar_kwh",
         "consumption_kwh",
+        "solar_forecast_kwh",
+        "consumption_forecast_kwh",
         "solar_to_battery_kwh",
         "grid_to_battery_kwh",
         "battery_to_home_kwh",
+        "battery_to_grid_kwh",
         "grid_to_home_kwh",
         "solar_to_home_kwh",
         "charge_to_battery_kwh",

@@ -638,6 +638,7 @@ class ProjectedIntervalFlow:
     solar_to_battery_kwh: float = 0.0
     grid_to_battery_kwh: float = 0.0
     battery_to_home_kwh: float = 0.0
+    battery_to_grid_kwh: float = 0.0
     grid_to_home_kwh: float = 0.0
     stored_energy_end_kwh: float = 0.0
     action_mask: int = 0
@@ -694,6 +695,7 @@ class ProjectedIntervalFlow:
                 "solar_to_battery_kwh": self.solar_to_battery_kwh,
                 "grid_to_battery_kwh": self.grid_to_battery_kwh,
                 "battery_to_home_kwh": self.battery_to_home_kwh,
+                "battery_to_grid_kwh": self.battery_to_grid_kwh,
                 "grid_to_home_kwh": self.grid_to_home_kwh,
                 "stored_energy_end_kwh": self.stored_energy_end_kwh,
                 "action_mask": self.action_mask,
@@ -738,6 +740,7 @@ class ProjectedBatteryFlow:
     stored_energy_end_kwh: float
     stored_energy_charged_kwh: float
     stored_energy_discharged_kwh: float
+    battery_to_grid_kwh: float = 0.0
     action_mask: int = 0
 
     def to_dict(self) -> dict[str, Any]:
@@ -884,6 +887,7 @@ def _entry_amount(
             "grid_charge_kwh",
             "amount_kwh",
             "energy_kwh",
+            "planned_energy_kwh",
             "amount",
             "value",
         ):
@@ -904,6 +908,7 @@ def _entry_amount(
             "grid_charge_kwh",
             "amount_kwh",
             "energy_kwh",
+            "planned_energy_kwh",
             "amount",
             "value",
         ):
@@ -1031,6 +1036,7 @@ def simulate_battery_projection(
     *,
     allocations: Any = None,
     grid_charge_kwh: Any = None,
+    discharge_allocations: Any = None,
     allocation_energy_kind: str = "stored",
     charge_efficiency: float = CHARGE_EFFICIENCY,
     discharge_efficiency: float = 1.0,
@@ -1047,6 +1053,10 @@ def simulate_battery_projection(
     existing ``SlotAllocation``-shaped objects.  Existing chronological
     allocations use stored battery-side kWh, so that is the default.  Pass
     ``allocation_energy_kind="input"`` for AC-side quota values.
+
+    ``discharge_allocations`` provides optional export discharge quotas, such
+    as high-price discharge trigger allocations or anti-curtailment pre-discharge
+    slots.
 
     A mapping keyed by battery key supplies per-battery quotas; ``all``/``*``
     can be used for a system-wide quota.  This helper does not infer price
@@ -1107,6 +1117,9 @@ def simulate_battery_projection(
     global_allocations, per_battery_allocations = _per_battery_sources(
         allocation_source, battery_keys
     )
+    global_discharge, per_battery_discharge = _per_battery_sources(
+        discharge_allocations, battery_keys
+    )
 
     for index, interval in enumerate(interval_list):
         physical_seconds = (
@@ -1131,6 +1144,7 @@ def simulate_battery_projection(
         solar_to_battery = 0.0
         grid_to_battery = 0.0
         battery_to_home = 0.0
+        battery_to_grid = 0.0
         remaining_deficit = deficit
         stored_energy_start = sum(states.values())
         stored_energy_charged = 0.0
@@ -1140,6 +1154,11 @@ def simulate_battery_projection(
         global_quota_remaining = (
             _amount_from_source(global_allocations, index, interval_list)
             if not per_battery_allocations
+            else 0.0
+        )
+        global_discharge_remaining = (
+            _amount_from_source(global_discharge, index, interval_list)
+            if not per_battery_discharge
             else 0.0
         )
         system_charge_remaining = (
@@ -1261,6 +1280,7 @@ def simulate_battery_projection(
                 "minimum": minimum,
                 "discharge_power": discharge_power,
                 "discharge_output": 0.0,
+                "export_output": 0.0,
             }
 
         # Run discharge after all charge allocation.  A given battery cannot
@@ -1280,35 +1300,62 @@ def simulate_battery_projection(
             discharge_eff = values["discharge_eff"]
             if values["solar_input"] > _EPSILON or values["grid_input"] > _EPSILON:
                 discharge_output = 0.0
+                export_output = 0.0
             elif (
                 not battery.can_discharge
                 or discharge_eff <= _EPSILON
                 or duration_hours <= _EPSILON
             ):
                 discharge_output = 0.0
+                export_output = 0.0
             else:
                 power_cap = values["discharge_power"] * duration_hours / 1000.0
                 available_output = max(
                     0.0, (states[key] - values["minimum"]) * discharge_eff
                 )
-                discharge_output = min(
+                home_discharge = min(
                     remaining_deficit,
                     power_cap,
                     available_output,
                     system_discharge_remaining,
                 )
+                discharge_output = home_discharge
+
+                if per_battery_discharge:
+                    discharge_quota = _amount_from_source(
+                        per_battery_discharge.get(key), index, interval_list, key
+                    )
+                else:
+                    discharge_quota = global_discharge_remaining
+
+                export_cap = max(
+                    0.0,
+                    min(
+                        power_cap - home_discharge,
+                        available_output - home_discharge,
+                        system_discharge_remaining - home_discharge,
+                    ),
+                )
+                export_output = min(max(0.0, discharge_quota), export_cap)
+                if not per_battery_discharge:
+                    global_discharge_remaining = max(
+                        0.0, global_discharge_remaining - export_output
+                    )
+
+            total_discharge = discharge_output + export_output
             values["discharge_output"] = discharge_output
+            values["export_output"] = export_output
             system_discharge_remaining = max(
-                0.0, system_discharge_remaining - discharge_output
+                0.0, system_discharge_remaining - total_discharge
             )
-            states[key] -= (
-                discharge_output / discharge_eff if discharge_eff > _EPSILON else 0.0
+            stored_delta = (
+                total_discharge / discharge_eff if discharge_eff > _EPSILON else 0.0
             )
+            states[key] -= stored_delta
             battery_to_home += discharge_output
+            battery_to_grid += export_output
             remaining_deficit = max(0.0, remaining_deficit - discharge_output)
-            stored_energy_discharged += (
-                discharge_output / discharge_eff if discharge_eff > _EPSILON else 0.0
-            )
+            stored_energy_discharged += stored_delta
 
         for (
             battery,
@@ -1324,8 +1371,14 @@ def simulate_battery_projection(
             solar_input = values["solar_input"]
             grid_input = values["grid_input"]
             discharge_output = values["discharge_output"]
+            export_output = values["export_output"]
             charge_eff = values["charge_eff"]
             discharge_eff = values["discharge_eff"]
+            total_discharged_stored = (
+                (discharge_output + export_output) / discharge_eff
+                if discharge_eff > _EPSILON
+                else 0.0
+            )
             per_interval.append(
                 ProjectedBatteryFlow(
                     battery_key=key,
@@ -1334,18 +1387,15 @@ def simulate_battery_projection(
                     solar_to_battery_kwh=solar_input,
                     grid_to_battery_kwh=grid_input,
                     battery_to_home_kwh=discharge_output,
+                    battery_to_grid_kwh=export_output,
                     stored_energy_start_kwh=values["start_stored"],
                     stored_energy_end_kwh=states[key],
                     stored_energy_charged_kwh=(solar_input + grid_input) * charge_eff,
-                    stored_energy_discharged_kwh=(
-                        discharge_output / discharge_eff
-                        if discharge_eff > _EPSILON
-                        else 0.0
-                    ),
+                    stored_energy_discharged_kwh=total_discharged_stored,
                     action_mask=compose_action_mask(
                         solar_charge=solar_input > _EPSILON,
                         grid_charge=grid_input > _EPSILON,
-                        discharge=discharge_output > _EPSILON,
+                        discharge=(discharge_output + export_output) > _EPSILON,
                     ),
                 )
             )
@@ -1367,7 +1417,7 @@ def simulate_battery_projection(
         action_mask = compose_action_mask(
             solar_charge=solar_to_battery > _EPSILON,
             grid_charge=grid_to_battery > _EPSILON,
-            discharge=battery_to_home > _EPSILON,
+            discharge=(battery_to_home + battery_to_grid) > _EPSILON,
         )
         projected = interval.projected
         if projected is None:
@@ -1378,7 +1428,7 @@ def simulate_battery_projection(
             else 0.0
         )
         discharge_power = (
-            battery_to_home / duration_hours * 1000.0
+            (battery_to_home + battery_to_grid) / duration_hours * 1000.0
             if duration_hours > _EPSILON
             else 0.0
         )
@@ -1391,6 +1441,7 @@ def simulate_battery_projection(
                 solar_to_battery_kwh=solar_to_battery,
                 grid_to_battery_kwh=grid_to_battery,
                 battery_to_home_kwh=battery_to_home,
+                battery_to_grid_kwh=battery_to_grid,
                 grid_to_home_kwh=grid_to_home,
                 stored_energy_end_kwh=sum(states.values()),
                 action_mask=action_mask,
@@ -1468,6 +1519,7 @@ def project_charge_delay(
     now: datetime | None = None,
     allocations: Any = None,
     grid_charge_kwh: Any = None,
+    discharge_allocations: Any = None,
     allocation_energy_kind: str = "stored",
     charge_efficiency: float = CHARGE_EFFICIENCY,
     discharge_efficiency: float = 1.0,
@@ -1523,6 +1575,7 @@ def project_charge_delay(
         valid,
         allocations=allocations,
         grid_charge_kwh=grid_charge_kwh,
+        discharge_allocations=discharge_allocations,
         allocation_energy_kind=allocation_energy_kind,
         charge_efficiency=charge_efficiency,
         discharge_efficiency=discharge_efficiency,

@@ -49,6 +49,7 @@ class DailyOperationProjectionRequest:
     battery_inputs: Sequence[BatteryProjectionInput]
     mode: str
     decision_data: Mapping[str, Any]
+    discharge_allocations: Sequence[Any] = ()
     predictive_charging_enabled: bool = False
     has_selected_schedule: bool = False
     setpoint_enabled: bool = False
@@ -72,6 +73,7 @@ class DailyOperationProjectionRequest:
         """Detach every collection from its controller-owned source."""
         object.__setattr__(self, "plan_intervals", tuple(self.plan_intervals))
         object.__setattr__(self, "allocations", tuple(self.allocations))
+        object.__setattr__(self, "discharge_allocations", tuple(self.discharge_allocations))
         object.__setattr__(self, "battery_inputs", tuple(self.battery_inputs))
         object.__setattr__(
             self,
@@ -246,6 +248,7 @@ def build_daily_operation_projection(
         projection_inputs,
         request.battery_inputs,
         allocations=request.allocations,
+        discharge_allocations=request.discharge_allocations,
         context_masks=context_masks,
         grid_charge_decisions=grid_decisions,
         charge_availability=charge_availability,
@@ -293,6 +296,7 @@ def build_daily_operation_projection(
                 "solar_to_battery_kwh": 0.0,
                 "grid_to_battery_kwh": 0.0,
                 "battery_to_home_kwh": 0.0,
+                "battery_to_grid_kwh": 0.0,
                 "grid_to_home_kwh": 0.0,
                 "solar_to_home_kwh": 0.0,
                 "action_mask": 0,
@@ -315,6 +319,7 @@ def build_daily_operation_projection(
             "solar_to_battery_kwh",
             "grid_to_battery_kwh",
             "battery_to_home_kwh",
+            "battery_to_grid_kwh",
             "grid_to_home_kwh",
             "solar_to_home_kwh",
             "duration_seconds",
@@ -370,15 +375,16 @@ def build_daily_operation_projection(
             if duration > 0.0
             else 0.0
         )
+        total_discharge = item["battery_to_home_kwh"] + item["battery_to_grid_kwh"]
         item["discharge_power_w"] = (
-            item["battery_to_home_kwh"] / duration * 3600.0 * 1000.0
+            total_discharge / duration * 3600.0 * 1000.0
             if duration > 0.0
             else 0.0
         )
         item["charge_to_battery_kwh"] = (
             item["solar_to_battery_kwh"] + item["grid_to_battery_kwh"]
         )
-        item["discharge_from_battery_kwh"] = item["battery_to_home_kwh"]
+        item["discharge_from_battery_kwh"] = total_discharge
         if capacity > 0.0:
             item["soc_end_pct"] = item["stored_energy_end_kwh"] / capacity * 100.0
         item["setpoint_active"] = bool(item["context_mask"] & CONTEXT_SETPOINT)

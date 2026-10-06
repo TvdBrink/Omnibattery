@@ -443,28 +443,28 @@ def build_solar_timeline(
         reasons.append("invalid_mode")
         mode = "active"
 
+    provider, reason = provider_weights(
+        boundaries,
+        provider_periods,
+        solar_start=solar_start,
+        solar_end=solar_end,
+    )
+    if provider is not None:
+        candidates.append(("provider", provider, 0))
+    elif provider_periods:
+        reason = reason or "provider_invalid"
+        provider_reasons.append(reason)
+        reasons.append(reason)
+
+    legacy, reason = legacy_shape_weights(boundaries, temporal_shape)
+    if legacy is not None:
+        candidates.append(("provider", legacy, 0))
+    elif temporal_shape is not None:
+        reason = reason or "legacy_shape_invalid"
+        provider_reasons.append(reason)
+        reasons.append(reason)
+
     if mode != "off":
-        provider, reason = provider_weights(
-            boundaries,
-            provider_periods,
-            solar_start=solar_start,
-            solar_end=solar_end,
-        )
-        if provider is not None:
-            candidates.append(("provider", provider, 0))
-        elif provider_periods:
-            reason = reason or "provider_invalid"
-            provider_reasons.append(reason)
-            reasons.append(reason)
-
-        legacy, reason = legacy_shape_weights(boundaries, temporal_shape)
-        if legacy is not None:
-            candidates.append(("provider", legacy, 0))
-        elif temporal_shape is not None:
-            reason = reason or "legacy_shape_invalid"
-            provider_reasons.append(reason)
-            reasons.append(reason)
-
         if learned_mature:
             learned, reason = progress_shape_weights(
                 boundaries, learned_shape, solar_start, solar_end

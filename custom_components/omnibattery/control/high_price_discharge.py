@@ -50,7 +50,11 @@ from ..pricing.high_price_discharge import (
     HorizonSlot,
     plan_high_price_discharge,
 )
-from ..solar_forecast import get_configured_solar_forecast_sensor
+from ..solar_forecast import (
+    get_configured_solar_forecast_sensor,
+    solar_forecast_local_timezone,
+    solar_periods_from_wh_hours,
+)
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
@@ -307,6 +311,14 @@ class HighPriceDischargeManager:
         self._solar_wh_hours = data.get("wh_hours", {}) if isinstance(data, dict) else {}
         self._solar_wh_fetched_mono = monotonic()
         self._last_rebuild_mono = None
+        controller = self._controller
+        if hasattr(controller, "_energy_solar_wh_hours"):
+            controller._energy_solar_wh_hours = dict(self._solar_wh_hours)
+            controller._energy_solar_periods = solar_periods_from_wh_hours(
+                self._solar_wh_hours,
+                default_timezone=solar_forecast_local_timezone(self._hass, controller),
+            )
+            controller._energy_solar_wh_fetched_mono = self._solar_wh_fetched_mono
 
     def _maybe_rebuild(self, config: tuple) -> None:
         """Rebuild the plan when the throttle is due or the config changed."""
